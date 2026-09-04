@@ -17,6 +17,7 @@
 
 #include "kudu/util/metrics.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -49,6 +50,7 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using std::array;
 using std::ostringstream;
 using std::string;
 using std::unordered_map;
@@ -59,8 +61,23 @@ DECLARE_int32(metrics_retirement_age_ms);
 DECLARE_bool(metrics_prometheus_use_entity_labels);
 DECLARE_bool(metrics_prometheus_export_hostname);
 DECLARE_string(metrics_prometheus_default_merge_rules);
+DECLARE_string(metrics_prometheus_default_quantiles);
 
 namespace kudu {
+
+namespace {
+// Collect the selected quantile tags (skipping the unused nullptr slots) into a
+// vector of strings, so that a selection can be compared by content in tests.
+vector<string> SelectedQuantileTags(const HistogramQuantiles& quantiles) {
+  vector<string> tags;
+  for (const char* tag : quantiles) {
+    if (tag != nullptr) {
+      tags.emplace_back(tag);
+    }
+  }
+  return tags;
+}
+} // anonymous namespace
 
 METRIC_DEFINE_entity(test_entity);
 
@@ -538,7 +555,7 @@ TEST_F(MetricsTest, CounterPrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(requests->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(requests->WriteAsPrometheus(&writer, "", "", {}));
 
   const string expected_output = "# HELP test_counter Description of test counter\n"
                                  "# TYPE test_counter counter\n"
@@ -608,7 +625,7 @@ TEST_F(MetricsTest, StringGaugeForPrometheus) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(state->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(state->WriteAsPrometheus(&writer, "", "", {}));
   // String-based gauges are not consumable by Prometheus.
   ASSERT_EQ("", output.str());
 
@@ -617,14 +634,14 @@ TEST_F(MetricsTest, StringGaugeForPrometheus) {
     const Metric* g = state.get();
     ostringstream output;
     PrometheusWriter writer(&output);
-    ASSERT_OK(g->WriteAsPrometheus(&writer, "", ""));
+    ASSERT_OK(g->WriteAsPrometheus(&writer, "", "", {}));
     ASSERT_EQ("", output.str());
   }
   {
     const Metric* m = state.get();
     ostringstream output;
     PrometheusWriter writer(&output);
-    ASSERT_OK(m->WriteAsPrometheus(&writer, "", ""));
+    ASSERT_OK(m->WriteAsPrometheus(&writer, "", "", {}));
     ASSERT_EQ("", output.str());
   }
 }
@@ -645,7 +662,7 @@ TEST_F(MetricsTest, StringFunctionGaugeForPrometheus) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(gauge->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(gauge->WriteAsPrometheus(&writer, "", "", {}));
   // String-based gauges are not consumable by Prometheus.
   ASSERT_EQ("", output.str());
 }
@@ -731,7 +748,7 @@ TEST_F(MetricsTest, MeanGaugePrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(average_usage->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(average_usage->WriteAsPrometheus(&writer, "", "", {}));
 
   const string expected_output = "# HELP test_mean_gauge Description of mean Gauge\n"
                                  "# TYPE test_mean_gauge gauge\n"
@@ -759,7 +776,7 @@ TEST_F(MetricsTest, MeanGaugePrometheusCountUnitTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(gauge->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(gauge->WriteAsPrometheus(&writer, "", "", {}));
 
   const string& result = output.str();
   // The main metric and _sum should carry the original unit ("bytes").
@@ -847,7 +864,7 @@ TEST_F(MetricsTest, AtomicGaugePrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(mem_usage->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(mem_usage->WriteAsPrometheus(&writer, "", "", {}));
 
   const string expected_output = "# HELP test_gauge Description of Test Gauge\n"
                                  "# TYPE test_gauge gauge\n"
@@ -862,7 +879,7 @@ TEST_F(MetricsTest, AtomicGaugeBooleanPrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(clock_extrapolating->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(clock_extrapolating->WriteAsPrometheus(&writer, "", "", {}));
 
   const string expected_output = "# HELP test_gauge_bool Description of Test boolean Gauge\n"
                                  "# TYPE test_gauge_bool gauge\n"
@@ -1018,7 +1035,7 @@ TEST_F(MetricsTest, FunctionGaugePrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(gauge->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(gauge->WriteAsPrometheus(&writer, "", "", {}));
 
   const string expected_output = "# HELP test_func_gauge Test Gauge 2\n"
                                  "# TYPE test_func_gauge gauge\n"
@@ -1112,7 +1129,7 @@ TEST_F(MetricsTest, HistogramPrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(hist->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(hist->WriteAsPrometheus(&writer, "", "", {}));
   ASSERT_EQ(kExpectedOutput, output.str());
 }
 
@@ -1132,7 +1149,7 @@ TEST_F(MetricsTest, HistogramPrometheusCountUnitTest) {
   // Pass entity labels to simulate a real tablet entity context, e.g.:
   //   kudu_test_hist_count{type="tablet",id="abc123",...,unit_type="units"} 5
   ASSERT_OK(hist->WriteAsPrometheus(
-      &writer, "kudu_", "type=\"tablet\",id=\"abc123\""));
+      &writer, "kudu_", "type=\"tablet\",id=\"abc123\"", {}));
 
   const string& result = output.str();
   // The quantile lines should carry the original unit.
@@ -1187,7 +1204,7 @@ TEST_F(MetricsTest, HistogramLegacyPrometheusTest) {
 
   ostringstream output;
   PrometheusWriter writer(&output);
-  ASSERT_OK(hist->WriteAsPrometheus(&writer, "", ""));
+  ASSERT_OK(hist->WriteAsPrometheus(&writer, "", "", {}));
   ASSERT_EQ(kExpectedOutput, output.str());
 }
 
@@ -1228,6 +1245,107 @@ TEST_F(MetricsTest, MergedHistogramPrometheusTest) {
   ASSERT_STR_CONTAINS(out,
       "kudu_test_hist_count{type=\"merged_entity\",id=\"diff_attr\","
       "unit_type=\"units\"} 4\n");
+}
+
+// Only the selected quantiles are exported; the '_sum' and '_count' lines are
+// always exported regardless of the selection.
+TEST_F(MetricsTest, HistogramPrometheusSelectedQuantilesTest) {
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = true;
+
+  scoped_refptr<Histogram> hist = METRIC_test_hist.Instantiate(entity_);
+  hist->IncrementBy(1, 700);
+  hist->IncrementBy(2, 200);
+  hist->IncrementBy(3, 50);
+  hist->IncrementBy(4, 40);
+  hist->IncrementBy(5, 10);
+
+  MetricPrometheusOptions opts;
+  opts.quantiles = {"0.99", "0.999"};
+
+  ostringstream output;
+  PrometheusWriter writer(&output);
+  ASSERT_OK(hist->WriteAsPrometheus(&writer, "", "", opts));
+
+  const string& out = output.str();
+  // The two selected quantiles are present.
+  ASSERT_STR_CONTAINS(out, "test_hist{unit_type=\"milliseconds\",quantile=\"0.99\"} 4\n");
+  ASSERT_STR_CONTAINS(out, "test_hist{unit_type=\"milliseconds\",quantile=\"0.999\"} 5\n");
+  // The unselected quantiles, including the min ('0') and max ('1'), are absent.
+  ASSERT_STR_NOT_CONTAINS(out, "quantile=\"0\"");
+  ASSERT_STR_NOT_CONTAINS(out, "quantile=\"0.75\"");
+  ASSERT_STR_NOT_CONTAINS(out, "quantile=\"0.95\"");
+  ASSERT_STR_NOT_CONTAINS(out, "quantile=\"0.9999\"");
+  ASSERT_STR_NOT_CONTAINS(out, "quantile=\"1\"");
+  ASSERT_EQ(2, CountSubstring(out, ",quantile="));
+  // The _sum and _count lines are always exported.
+  ASSERT_STR_CONTAINS(out, "test_hist_sum{unit_type=\"milliseconds\"} 1460\n");
+  ASSERT_STR_CONTAINS(out, "test_hist_count{unit_type=\"units\"} 1000\n");
+}
+
+// The server-wide --metrics_prometheus_default_quantiles is applied when a
+// request carries no 'quantiles' of its own.
+TEST_F(MetricsTest, PrometheusDefaultQuantilesFromFlagTest) {
+  google::FlagSaver saver;
+  FLAGS_metrics_prometheus_use_entity_labels = true;
+  FLAGS_metrics_prometheus_default_quantiles = "0.99,0.999";
+
+  scoped_refptr<Histogram> hist = METRIC_test_hist.Instantiate(entity_);
+  hist->IncrementBy(1, 700);
+  hist->IncrementBy(2, 200);
+  hist->IncrementBy(3, 50);
+  hist->IncrementBy(4, 40);
+  hist->IncrementBy(5, 10);
+
+  // No per-request quantiles: the flag default drives the selection.
+  MetricPrometheusOptions opts;
+  GetPrometheusQuantiles(/*request_quantiles=*/{}, &opts.quantiles);
+  ASSERT_EQ((vector<string>{"0.99", "0.999"}), SelectedQuantileTags(opts.quantiles));
+
+  ostringstream output;
+  PrometheusWriter writer(&output);
+  ASSERT_OK(hist->WriteAsPrometheus(&writer, "", "", opts));
+
+  const string& out = output.str();
+  ASSERT_EQ(2, CountSubstring(out, ",quantile="));
+  ASSERT_STR_CONTAINS(out, "quantile=\"0.99\"");
+  ASSERT_STR_CONTAINS(out, "quantile=\"0.999\"");
+}
+
+// Quantiles supplied with the request take precedence over the flag default.
+TEST_F(MetricsTest, PrometheusRequestQuantilesOverrideFlagTest) {
+  google::FlagSaver saver;
+  // The flag would export only p75...
+  FLAGS_metrics_prometheus_default_quantiles = "0.75";
+
+  // ...but the request asks for p99 instead.
+  HistogramQuantiles quantiles{};
+  GetPrometheusQuantiles(/*request_quantiles=*/{"0.99"}, &quantiles);
+  ASSERT_EQ((vector<string>{"0.99"}), SelectedQuantileTags(quantiles));
+}
+
+// Unknown quantile tags are dropped and duplicates are collapsed; when every
+// tag is unknown the result is empty, which means "export all quantiles".
+TEST_F(MetricsTest, PrometheusUnknownQuantilesFlagTest) {
+  google::FlagSaver saver;
+
+  // A bogus tag alongside valid ones: only the valid tags survive, in order.
+  FLAGS_metrics_prometheus_default_quantiles = "0.99,bogus,0.999";
+  HistogramQuantiles quantiles{};
+  GetPrometheusQuantiles(/*request_quantiles=*/{}, &quantiles);
+  ASSERT_EQ((vector<string>{"0.99", "0.999"}), SelectedQuantileTags(quantiles));
+
+  // Duplicate tags are collapsed.
+  FLAGS_metrics_prometheus_default_quantiles = "0.99,0.99";
+  quantiles = {};
+  GetPrometheusQuantiles(/*request_quantiles=*/{}, &quantiles);
+  ASSERT_EQ((vector<string>{"0.99"}), SelectedQuantileTags(quantiles));
+
+  // All tags unknown: no selection is resolved, so all quantiles are exported.
+  FLAGS_metrics_prometheus_default_quantiles = "bogus";
+  quantiles = {};
+  GetPrometheusQuantiles(/*request_quantiles=*/{}, &quantiles);
+  ASSERT_EQ((vector<string>{}), SelectedQuantileTags(quantiles));
 }
 
 TEST_F(MetricsTest, JsonPrintTest) {

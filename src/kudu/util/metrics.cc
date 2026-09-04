@@ -16,6 +16,9 @@
 // under the License.
 #include "kudu/util/metrics.h"
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <iostream>
 #include <tuple>
 #include <utility>
@@ -32,7 +35,60 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/hdr_histogram.h"
 #include "kudu/util/histogram.pb.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/status.h"
+
+using std::string;
+using std::unordered_set;
+using std::vector;
+using strings::Substitute;
+using strings::SubstituteAndAppend;
+
+namespace {
+// The quantile lines a histogram exports in Prometheus format, in output order.
+// 'tag' is the value of the Prometheus 'quantile' label and the token accepted
+// by --metrics_prometheus_default_quantiles and the 'quantiles' query parameter.
+// The min ('0') and max ('1') export the exact recorded extrema; the others
+// export the value at 'percentile' (as passed to HdrHistogram::ValueAtPercentile).
+// This is the single canonical description of the preset quantiles.
+struct HistogramQuantile {
+  enum class Source {
+    kMinValue,    // exact recorded minimum, tagged '0'
+    kMaxValue,    // exact recorded maximum, tagged '1'
+    kPercentile,  // value at 'percentile'
+  };
+  const char* const tag;
+  const Source source;
+  const double percentile;  // only meaningful when source == kPercentile
+};
+constexpr HistogramQuantile kHistogramQuantiles[] = {
+  { "0",      HistogramQuantile::Source::kMinValue,   0.0   },
+  { "0.75",   HistogramQuantile::Source::kPercentile, 75.0  },
+  { "0.95",   HistogramQuantile::Source::kPercentile, 95.0  },
+  { "0.99",   HistogramQuantile::Source::kPercentile, 99.0  },
+  { "0.999",  HistogramQuantile::Source::kPercentile, 99.9  },
+  { "0.9999", HistogramQuantile::Source::kPercentile, 99.99 },
+  { "1",      HistogramQuantile::Source::kMaxValue,   0.0   },
+};
+static_assert(arraysize(kHistogramQuantiles) == kudu::kNumHistogramQuantiles,
+              "kNumHistogramQuantiles must match the kHistogramQuantiles table");
+
+bool IsKnownQuantileTag(const string& tag) {
+  for (const auto& q : kHistogramQuantiles) {
+    if (tag == q.tag) {
+      return true;
+    }
+  }
+  return false;
+}
+} // anonymous namespace
+
+// The canonical human-readable list of accepted quantile tags. Kept as a macro
+// (rather than a constexpr variable) so it can be spliced directly into the
+// adjacent string literals of the flag description and the warning messages
+// below, keeping all of them in sync with the kHistogramQuantiles table.
+#define KUDU_KNOWN_QUANTILE_TAGS \
+  "'0', '0.75', '0.95', '0.99', '0.999', '0.9999', '1'"
 
 DEFINE_int32(metrics_retirement_age_ms, 120 * 1000,
              "The minimum number of milliseconds a metric will be kept for after it is "
@@ -90,15 +146,45 @@ DEFINE_validator(metrics_prometheus_default_merge_rules,
   return true;
 });
 
+DEFINE_string(metrics_prometheus_default_quantiles, "",
+              "The default set of histogram quantiles exported by the "
+              "'/metrics_prometheus' endpoint when the request does not carry a "
+              "'quantiles' query parameter. The value is a comma-separated list "
+              "of quantile tags, each one of " KUDU_KNOWN_QUANTILE_TAGS
+              " (where '0' and '1' are the min and max). "
+              "For example, '0.99,0.999' exports only the p99 and p999 lines, "
+              "which further reduces the number of exported time series on top "
+              "of entity merging. Empty by default, i.e. all quantiles are "
+              "exported. The '_sum' and '_count' lines are always exported "
+              "regardless of this setting.");
+TAG_FLAG(metrics_prometheus_default_quantiles, advanced);
+TAG_FLAG(metrics_prometheus_default_quantiles, runtime);
+TAG_FLAG(metrics_prometheus_default_quantiles, evolving);
+DEFINE_validator(metrics_prometheus_default_quantiles,
+                 [](const char* flag_name, const string& value) {
+  // An empty value exports all quantiles and is always valid. Otherwise warn
+  // about (but tolerate) unknown tags so that a typo surfaces in the logs
+  // instead of silently dropping quantiles. Known tags in the same value are
+  // still applied; see GetPrometheusQuantiles().
+  if (value.empty()) {
+    return true;
+  }
+  vector<string> raw_quantiles;
+  SplitStringUsing(value, ",", &raw_quantiles);
+  for (const auto& raw_quantile : raw_quantiles) {
+    if (!IsKnownQuantileTag(raw_quantile)) {
+      LOG(WARNING) << Substitute(
+          "ignoring unknown quantile '$0' in --$1: expected one of "
+          KUDU_KNOWN_QUANTILE_TAGS,
+          raw_quantile, flag_name);
+    }
+  }
+  return true;
+});
+
 // Process/server-wide metrics should go into the 'server' entity.
 // More complex applications will define other entities.
 METRIC_DEFINE_entity(server);
-
-using std::string;
-using std::unordered_set;
-using std::vector;
-using strings::Substitute;
-using strings::SubstituteAndAppend;
 
 namespace kudu {
 
@@ -124,9 +210,10 @@ void WriteMetricsToJson(JsonWriter* writer,
 void WriteMetricsPrometheus(PrometheusWriter* writer,
                             const MetricEntity::MetricMap& metrics,
                             const string& prefix,
-                            const string& labels) {
+                            const string& labels,
+                            const MetricPrometheusOptions& opts) {
   for (const auto& [name, val] : metrics) {
-    WARN_NOT_OK(val->WriteAsPrometheus(writer, prefix, labels),
+    WARN_NOT_OK(val->WriteAsPrometheus(writer, prefix, labels, opts),
                 Substitute("unable to write '$0' ($1) in Prometheus format",
                            val->prototype()->name(), val->prototype()->description()));
   }
@@ -173,7 +260,7 @@ void WriteToPrometheus(PrometheusWriter* writer,
                                                 entity_metrics.first.id_);
     labels += hostname_label;
     for (const auto& [prototype, metric] : entity_metrics.second) {
-      WARN_NOT_OK(metric->WriteAsPrometheus(writer, "kudu_", labels),
+      WARN_NOT_OK(metric->WriteAsPrometheus(writer, "kudu_", labels, opts),
                   Substitute("unable to write '$0' ($1) in Prometheus format",
                              prototype->name(), prototype->description()));
     }
@@ -205,6 +292,53 @@ void GetPrometheusMergeRules(const vector<string>& request_merge_rules,
     vector<string> default_merge_rules;
     SplitStringUsing(FLAGS_metrics_prometheus_default_merge_rules, ",", &default_merge_rules);
     ParseMergeRules(default_merge_rules, merge_rules);
+  }
+}
+
+namespace {
+// Resolve the raw quantile tags into 'quantiles', keeping only known tags (see
+// kHistogramQuantiles) de-duplicated and in canonical output order. Unknown
+// tags are ignored with a warning, mirroring the lenient parsing of merge rules.
+void ParseQuantiles(const vector<string>& raw_quantiles,
+                    HistogramQuantiles* quantiles) {
+  for (const auto& raw_quantile : raw_quantiles) {
+    if (!IsKnownQuantileTag(raw_quantile)) {
+      // This runs for every request carrying a 'quantiles' parameter, so
+      // throttle the warning to avoid flooding the logs when a scraper is
+      // misconfigured to keep sending an unknown tag.
+      KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+          "ignoring unknown quantile '$0'; expected one of "
+          KUDU_KNOWN_QUANTILE_TAGS, raw_quantile) << THROTTLE_MSG;
+    }
+  }
+  // Emit the requested known tags in canonical order; considering each preset
+  // exactly once de-duplicates the request by construction. At most
+  // kNumHistogramQuantiles distinct tags exist, so 'n' never overflows -- the
+  // DCHECK guards that invariant against future changes to the table.
+  size_t n = 0;
+  for (const auto& q : kHistogramQuantiles) {
+    if (std::find(raw_quantiles.begin(), raw_quantiles.end(), q.tag) != raw_quantiles.end()) {
+      DCHECK_LT(n, kNumHistogramQuantiles);
+      (*quantiles)[n++] = q.tag;
+    }
+  }
+}
+} // anonymous namespace
+
+#undef KUDU_KNOWN_QUANTILE_TAGS
+
+void GetPrometheusQuantiles(const vector<string>& request_quantiles,
+                            HistogramQuantiles* quantiles) {
+  quantiles->fill(nullptr);
+  // A request's own 'quantiles' take precedence over the server-side default.
+  if (!request_quantiles.empty()) {
+    ParseQuantiles(request_quantiles, quantiles);
+    return;
+  }
+  if (!FLAGS_metrics_prometheus_default_quantiles.empty()) {
+    vector<string> default_quantiles;
+    SplitStringUsing(FLAGS_metrics_prometheus_default_quantiles, ",", &default_quantiles);
+    ParseQuantiles(default_quantiles, quantiles);
   }
 }
 
@@ -531,7 +665,7 @@ Status MetricEntity::WriteAsPrometheus(
     if (FLAGS_metrics_prometheus_export_hostname && !opts.hostname.empty()) {
       labels += ",hostname=\"" + EscapePrometheusLabelValue(opts.hostname) + "\"";
     }
-    WriteMetricsPrometheus(writer, metrics, "kudu_", labels);
+    WriteMetricsPrometheus(writer, metrics, "kudu_", labels, opts);
     return Status::OK();
   }
 
@@ -546,11 +680,11 @@ Status MetricEntity::WriteAsPrometheus(
       return Status::NotSupported(
           Substitute("$0: unexpected server-level metric entity", id_));
     }
-    WriteMetricsPrometheus(writer, metrics, prefix, "");
+    WriteMetricsPrometheus(writer, metrics, prefix, "", opts);
     return Status::OK();
   }
   const string prefix = Substitute("kudu_$0_$1_", prototype_->name(), id_);
-  WriteMetricsPrometheus(writer, metrics, prefix, "");
+  WriteMetricsPrometheus(writer, metrics, prefix, "", opts);
   return Status::OK();
 }
 
@@ -977,7 +1111,8 @@ Status Gauge::WriteAsJson(JsonWriter* writer,
 
 Status Gauge::WriteAsPrometheus(PrometheusWriter* writer,
                                 const string& prefix,
-                                const string& labels) const {
+                                const string& labels,
+                                const MetricPrometheusOptions& /*opts*/) const {
   prototype_->WriteHelpAndType(writer, prefix);
   WriteValue(writer, prefix, labels);
 
@@ -1070,7 +1205,8 @@ void StringGauge::WriteValue(PrometheusWriter* /*writer*/,
 
 Status StringGauge::WriteAsPrometheus(PrometheusWriter* /*writer*/,
                                       const string& /*prefix*/,
-                                      const string& /*labels*/) const {
+                                      const string& /*labels*/,
+                                      const MetricPrometheusOptions& /*opts*/) const {
   // Prometheus doesn't support string gauges.
   // This function ensures that output written to Prometheus is empty.
   return Status::OK();
@@ -1218,7 +1354,8 @@ Status Counter::WriteAsJson(JsonWriter* writer,
 
 Status Counter::WriteAsPrometheus(PrometheusWriter* writer,
                                   const string& prefix,
-                                  const string& labels) const {
+                                  const string& labels,
+                                  const MetricPrometheusOptions& /*opts*/) const {
   prototype_->WriteHelpAndType(writer, prefix);
   const string label_prefix = PrometheusLabelPrefixForInjection(labels);
   writer->WriteEntry(Substitute(
@@ -1303,19 +1440,34 @@ Status Histogram::WriteAsJson(JsonWriter* writer,
   return Status::OK();
 }
 
+namespace {
+// Whether the histogram quantile line tagged 'tag' is in the (non-empty)
+// selection 'quantiles'; the "export every quantile" default is handled by
+// callers. Compared by content, not pointer identity, since a selection may
+// hold a caller's own tag literals (e.g. in tests) whose addresses need not
+// match those in the kHistogramQuantiles table.
+bool IsQuantileSelected(const HistogramQuantiles& quantiles, const char* tag) {
+  return std::any_of(quantiles.begin(), quantiles.end(),
+                     [tag](const char* q) {
+                       return q != nullptr && strcmp(q, tag) == 0;
+                     });
+}
+
+// The exported value of the quantile line 'q' for the histogram snapshot 'h'.
+uint64_t HistogramQuantileValue(const HdrHistogram& h, const HistogramQuantile& q) {
+  switch (q.source) {
+    case HistogramQuantile::Source::kMinValue:   return h.MinValue();
+    case HistogramQuantile::Source::kMaxValue:   return h.MaxValue();
+    case HistogramQuantile::Source::kPercentile: return h.ValueAtPercentile(q.percentile);
+  }
+  return 0;  // not reached; all enumerators are handled above
+}
+} // anonymous namespace
+
 Status Histogram::WriteAsPrometheus(PrometheusWriter* writer,
                                     const string& prefix,
-                                    const string& labels) const {
-  static constexpr struct QuantileInfo {
-    const char* const tag;
-    const double quantile;
-  } kQuantiles[] = {
-    { "0.75",   75.0  },
-    { "0.95",   95.0  },
-    { "0.99",   99.0  },
-    { "0.999",  99.9  },
-    { "0.9999", 99.99 },
-  };
+                                    const string& labels,
+                                    const MetricPrometheusOptions& opts) const {
   static constexpr const char* const kHelpTypeFmt =
       "# HELP $0$1 $2\n# TYPE $3$4 $5\n";
 
@@ -1323,6 +1475,12 @@ Status Histogram::WriteAsPrometheus(PrometheusWriter* writer,
   DCHECK(name);
   const char* const unit = MetricUnit::Name(prototype_->unit());
   DCHECK(unit);
+
+  // An all-empty selection exports every quantile (the default). This is
+  // loop-invariant, so evaluate it once here rather than per quantile line.
+  const auto& quantiles = opts.quantiles;
+  const bool export_all = std::all_of(quantiles.begin(), quantiles.end(),
+                                      [](const char* q) { return q == nullptr; });
 
   // A snapshot is taken to have more consistent statistics while generating
   // the output.
@@ -1342,12 +1500,12 @@ Status Histogram::WriteAsPrometheus(PrometheusWriter* writer,
 
     const string label_prefix = PrometheusLabelPrefixForInjection(labels);
 
-    SubstituteAndAppend(&out, kFmt, prefix, name, label_prefix, unit, "0", h.MinValue());
-    for (const auto& [tag, q] : kQuantiles) {
-      SubstituteAndAppend(&out, kFmt, prefix, name, label_prefix, unit,
-                         tag, h.ValueAtPercentile(q));
+    for (const auto& q : kHistogramQuantiles) {
+      if (export_all || IsQuantileSelected(quantiles, q.tag)) {
+        SubstituteAndAppend(&out, kFmt, prefix, name, label_prefix, unit,
+                            q.tag, HistogramQuantileValue(h, q));
+      }
     }
-    SubstituteAndAppend(&out, kFmt, prefix, name, label_prefix, unit, "1", h.MaxValue());
 
     const string sum_name = Substitute("$0_sum", name);
     const string count_name = Substitute("$0_count", name);
@@ -1378,11 +1536,12 @@ Status Histogram::WriteAsPrometheus(PrometheusWriter* writer,
     static constexpr const char* const kLegacySumCountFmt =
         "$0$1 $2\n";
 
-    SubstituteAndAppend(&out, kLegacyFmt, prefix, name, unit, "0", h.MinValue());
-    for (const auto& [tag, q] : kQuantiles) {
-      SubstituteAndAppend(&out, kLegacyFmt, prefix, name, unit, tag, h.ValueAtPercentile(q));
+    for (const auto& q : kHistogramQuantiles) {
+      if (export_all || IsQuantileSelected(quantiles, q.tag)) {
+        SubstituteAndAppend(&out, kLegacyFmt, prefix, name, unit,
+                            q.tag, HistogramQuantileValue(h, q));
+      }
     }
-    SubstituteAndAppend(&out, kLegacyFmt, prefix, name, unit, "1", h.MaxValue());
 
     const string sum_name = Substitute("$0_sum", name);
     const string count_name = Substitute("$0_count", name);

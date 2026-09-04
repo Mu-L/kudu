@@ -124,6 +124,10 @@ namespace {
 // '/metrics_prometheus' endpoints.
 constexpr const char* const kMergeRulesParam = "merge_rules";
 
+// Query parameter selecting the histogram quantiles exported by the
+// '/metrics_prometheus' endpoint.
+constexpr const char* const kQuantilesParam = "quantiles";
+
 // Html/Text formatting tags
 struct Tags {
   string pre_tag, end_pre_tag, line_break, header, end_header;
@@ -543,6 +547,10 @@ static void WriteMetricsAsPrometheus(const MetricRegistry* const metrics,
   // A 'merge_rules' query parameter takes precedence over the server-side
   // default configured via --metrics_prometheus_default_merge_rules.
   GetPrometheusMergeRules(ParseArray(req.parsed_args, kMergeRulesParam), &opts.merge_rules);
+
+  // A 'quantiles' query parameter takes precedence over the server-side
+  // default configured via --metrics_prometheus_default_quantiles.
+  GetPrometheusQuantiles(ParseArray(req.parsed_args, kQuantilesParam), &opts.quantiles);
 
   // The hostname label is emitted either in the label-based non-merged format,
   // or whenever merging is active (merged output is always label-based).

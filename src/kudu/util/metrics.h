@@ -226,6 +226,7 @@
 /////////////////////////////////////////////////////
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -482,6 +483,28 @@ void ParseMergeRules(const std::vector<std::string>& raw_merge_rules,
 void GetPrometheusMergeRules(const std::vector<std::string>& request_merge_rules,
                              MetricMergeRules* merge_rules);
 
+// The number of preset histogram quantile lines a Kudu histogram can export in
+// the Prometheus format: the min ('0'), 0.75, 0.95, 0.99, 0.999, 0.9999, and
+// the max ('1'). This is the upper bound on a quantile selection; see the
+// canonical kHistogramQuantiles table in metrics.cc.
+constexpr size_t kNumHistogramQuantiles = 7;
+
+// A selection of preset histogram quantiles to export, in canonical output
+// order. Each non-null element points to one of the statically allocated tag
+// literals owned by the canonical kHistogramQuantiles table in metrics.cc, so
+// no strings are ever copied or allocated; any unused trailing slots are
+// nullptr. An all-nullptr selection means "export every quantile".
+typedef std::array<const char*, kNumHistogramQuantiles> HistogramQuantiles;
+
+// Resolve the effective histogram quantile selection for a /metrics_prometheus
+// request into 'quantiles'. Quantiles supplied with the request
+// ('request_quantiles') take precedence over the server-wide default configured
+// via --metrics_prometheus_default_quantiles, which is applied only when the
+// request carries none. Unknown quantile tags are ignored; the selected tags
+// are stored de-duplicated and in canonical output order.
+void GetPrometheusQuantiles(const std::vector<std::string>& request_quantiles,
+                            HistogramQuantiles* quantiles);
+
 struct MetricJsonOptions {
   MetricJsonOptions() :
     include_raw_histograms(false),
@@ -564,6 +587,15 @@ struct MetricPrometheusOptions {
   //       where 'table' entities must keep their table_name label even when a
   //       'tablet' merge rule is supplied.
   MetricMergeRules merge_rules;
+
+  // The set of histogram quantiles to export (see HistogramQuantiles). Only the
+  // selected quantile lines are emitted; the '_sum' and '_count' lines are
+  // always emitted, and the default selection exports every quantile.
+  //
+  // Trimming quantiles is a way to further cut the number of exported time
+  // series -- and thus scrape payload and TSDB cardinality -- on top of
+  // entity merging (see merge_rules above).
+  HistogramQuantiles quantiles{};
 };
 
 class MetricEntityPrototype {
@@ -821,7 +853,8 @@ class Metric : public RefCountedThreadSafe<Metric> {
                              const MetricJsonOptions& opts) const = 0;
   // All metrics must be able to render themselves as Prometheus.
   virtual Status WriteAsPrometheus(PrometheusWriter* writer, const std::string& prefix,
-                                   const std::string& labels) const = 0;
+                                   const std::string& labels,
+                                   const MetricPrometheusOptions& opts) const = 0;
 
   const MetricPrototype* prototype() const { return prototype_; }
 
@@ -1095,7 +1128,8 @@ class Gauge : public Metric {
   Status WriteAsJson(JsonWriter* w, const MetricJsonOptions& opts) const override;
 
   Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
-                           const std::string& labels) const override;
+                           const std::string& labels,
+                           const MetricPrometheusOptions& opts) const override;
  protected:
   virtual void WriteValue(JsonWriter* writer) const = 0;
   virtual void WriteValue(PrometheusWriter* writer, const std::string& prefix,
@@ -1119,7 +1153,8 @@ class StringGauge : public Gauge {
   }
   void MergeFrom(const scoped_refptr<Metric>& other) override;
   Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
-                           const std::string& labels) const override;
+                           const std::string& labels,
+                           const MetricPrometheusOptions& opts) const override;
  protected:
   FRIEND_TEST(MetricsTest, SimpleStringGaugeForMergeTest);
   FRIEND_TEST(MetricsTest, StringGaugeForPrometheus);
@@ -1492,7 +1527,8 @@ class Counter : public Metric {
   Status WriteAsJson(JsonWriter* w, const MetricJsonOptions& opts) const override;
 
   Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
-                           const std::string& labels) const override;
+                           const std::string& labels,
+                           const MetricPrometheusOptions& opts) const override;
 
   bool IsUntouched() const override {
     return value() == 0;
@@ -1575,7 +1611,8 @@ class Histogram : public Metric {
   Status WriteAsJson(JsonWriter* w, const MetricJsonOptions& opts) const override;
 
   Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
-                           const std::string& labels) const override;
+                           const std::string& labels,
+                           const MetricPrometheusOptions& opts) const override;
 
   // Returns a snapshot of this histogram including the bucketed values and counts.
   Status GetHistogramSnapshotPB(HistogramSnapshotPB* snapshot_pb,
