@@ -1,0 +1,55 @@
+commit be223eb5418a68a5264eed4f9f6b0680f12f23d3
+Author: Nico Weber <thakis@chromium.org>
+Date:   Tue May 31 15:46:12 2022 -0400
+
+    sanitizers: Do not include crypt.h if SANITIZER_INTERCEPT_CRYPT_R is undef
+    
+    sanitizer_intercept_overriders.h might override SANITIZER_INTERCEPT_CRYPT_R to
+    be undefined. There's no need to require crypt.h in that case.
+    
+    (The motivation is that crypt() moved from glibc into its own package at some
+    point, which makes intercepting it and building with a single sysroot that
+    supports both pre-bullseye and post-bullseye a bit hairy.)
+    
+    Differential Revision: https://reviews.llvm.org/D126696
+
+diff --git a/projects/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp b/projects/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+index ecfcffb34a5a..2de160d8da56 100644
+--- a/projects/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
++++ b/projects/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+@@ -152,7 +152,6 @@ typedef struct user_fpregs elf_fpregset_t;
+ #include <linux/serial.h>
+ #include <sys/msg.h>
+ #include <sys/ipc.h>
+-#include <crypt.h>
+ #endif // SANITIZER_LINUX && !SANITIZER_ANDROID
+ 
+ #include <link.h>
+@@ -164,8 +164,13 @@ typedef struct user_fpregs elf_fpregset_t;
+
+ // Include these after system headers to avoid name clashes and ambiguities.
+ #include "sanitizer_internal_defs.h"
++#include "sanitizer_platform_interceptors.h"
+ #include "sanitizer_platform_limits_posix.h"
+ 
++#if SANITIZER_INTERCEPT_CRYPT_R
++#include <crypt.h>
++#endif
++
+ namespace __sanitizer {
+   unsigned struct_utsname_sz = sizeof(struct utsname);
+   unsigned struct_stat_sz = sizeof(struct stat);
+@@ -241,9 +245,12 @@ namespace __sanitizer {
+   unsigned struct_ustat_sz = SIZEOF_STRUCT_USTAT;
+   unsigned struct_rlimit64_sz = sizeof(struct rlimit64);
+   unsigned struct_statvfs64_sz = sizeof(struct statvfs64);
+-  unsigned struct_crypt_data_sz = sizeof(struct crypt_data);
+ #endif // SANITIZER_LINUX && !SANITIZER_ANDROID
+ 
++#if SANITIZER_INTERCEPT_CRYPT_R
++  unsigned struct_crypt_data_sz = sizeof(struct crypt_data);
++#endif
++
+ #if SANITIZER_LINUX && !SANITIZER_ANDROID
+   unsigned struct_timex_sz = sizeof(struct timex);
+   unsigned struct_msqid_ds_sz = sizeof(struct msqid_ds);

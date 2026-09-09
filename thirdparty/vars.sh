@@ -386,7 +386,7 @@ LIBUNWIND_PATCHES=(
 # The include-what-you-use is built along with LLVM in its source tree.
 IWYU_VERSION=0.15
 LLVM_VERSION=11.0.0
-LLVM_PATCHLEVEL=12
+LLVM_PATCHLEVEL=13
 LLVM_NAME=llvm-$LLVM_VERSION.src
 LLVM_SOURCE=$TP_SOURCE_DIR/$LLVM_NAME
 LLVM_ARCHIVE=llvm-$LLVM_VERSION-iwyu-$IWYU_VERSION.src.tar.gz
@@ -409,6 +409,9 @@ LLVM_PATCHES=(
  "patch -p1 < $TP_DIR/patches/llvm-section-mm-memory-mapper.patch"
  "patch -p1 < $TP_DIR/patches/llvm-section-mm-extra-methods.patch"
  "patch -p2 < $TP_DIR/patches/llvm-gcc15-fix-missing-cstdint-include.patch"
+ "patch -p1 < $TP_DIR/patches/llvm-crypt-00.patch"
+ "patch -p1 < $TP_DIR/patches/llvm-crypt-01.patch"
+ "patch -p1 < $TP_DIR/patches/llvm-remove-termio-struct.patch"
 )
 
 # All libcxxabi's variables are pointing to LLVM's: libcxxabi is built
